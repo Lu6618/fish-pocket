@@ -1,0 +1,136 @@
+# Build the app for a real iOS device and package an unsigned IPA.
+# Same setup steps as ios-build.yml (fetch nodejs-mobile, Python and FFmpeg,
+# build libgit2, assemble the engine tree, generate the project, compile),
+# but the compile destination is a generic iOS device instead of the simulator,
+# and the built .app is zipped into an unsigned IPA artifact.
+# Triggered manually only (workflow_dispatch); signing happens off-GitHub with zsign.
+name: iOS IPA
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # The Xcode the app is built with everywhere else: local builds and Xcode Cloud are on
+    # Xcode 27, and an older compiler here fails code they accept (it gave up type-checking a
+    # long SwiftUI body). `xcode-27` is GitHub's macOS 27 image, a preview for now.
+    runs-on: xcode-27
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: engine/package-lock.json
+
+      - name: Xcode
+        # The image's default is 27.1; local builds are on 27.2.
+        run: |
+          sudo xcode-select -s /Applications/Xcode_27.2.app
+          xcodebuild -version
+
+      - name: Cache nodejs-mobile
+        id: nodejs-mobile
+        uses: actions/cache@v5
+        with:
+          path: |
+            vendor/nodejs-mobile/ios
+            vendor/nodejs-mobile/rooted
+          key: nodejs-mobile-${{ hashFiles('scripts/fetch-nodejs-mobile.sh') }}
+
+      - name: Fetch nodejs-mobile
+        if: steps.nodejs-mobile.outputs.cache-hit != 'true'
+        run: scripts/fetch-nodejs-mobile.sh
+
+      - name: Cache Python
+        id: python
+        uses: actions/cache@v5
+        with:
+          path: |
+            vendor/python/ios
+            vendor/python/rooted
+          key: python-${{ hashFiles('scripts/fetch-python.sh') }}
+
+      - name: Fetch Python
+        if: steps.python.outputs.cache-hit != 'true'
+        run: scripts/fetch-python.sh
+
+      # A path function new to Node would slip past native/root: stop here instead.
+      - name: Check NodeMobile imports
+        run: scripts/check-root-imports.sh
+
+      # Only the installed slices and the xcframework; the source and build trees stay out.
+      - name: Cache libgit2
+        id: libgit2
+        uses: actions/cache@v5
+        with:
+          path: |
+            vendor/libgit2/Libgit2.xcframework
+            vendor/libgit2/ios-arm64
+            vendor/libgit2/ios-arm64-simulator
+            vendor/libgit2/macos
+          key: libgit2-${{ runner.os }}-${{ hashFiles('scripts/build-libgit2.sh') }}
+
+      - name: Build libgit2
+        if: steps.libgit2.outputs.cache-hit != 'true'
+        run: scripts/build-libgit2.sh
+
+      # Only the xcframework; the download, source and build trees stay out.
+      - name: Cache FFmpeg
+        id: ffmpeg
+        uses: actions/cache@v5
+        with:
+          path: vendor/ffmpeg/FFmpeg.xcframework
+          key: ffmpeg-${{ runner.os }}-${{ hashFiles('scripts/fetch-ffmpeg.sh', 'scripts/build-ffmpeg.sh', 'native/ffmpeg/**') }}
+
+      # The published framework, or a build from source when native/ffmpeg changed since.
+      - name: Fetch FFmpeg
+        if: steps.ffmpeg.outputs.cache-hit != 'true'
+        run: scripts/fetch-ffmpeg.sh
+
+      - name: Assemble engine
+        run: scripts/build-engine.sh
+
+      - name: Generate project
+        run: |
+          command -v xcodegen >/dev/null || brew install xcodegen
+          cd app && xcodegen generate --quiet
+
+      # The vendored xcframeworks are arm64 only; a generic destination would add x86_64.
+      # Device build (not simulator): produces Release-iphoneos/DshIOS.app, unsigned.
+      - name: Compile (iOS device)
+        working-directory: app
+        run: |
+          xcodebuild -project DshIOS.xcodeproj -scheme DshIOS \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build/DerivedData -skipPackagePluginValidation \
+            ARCHS=arm64 CODE_SIGNING_ALLOWED=NO \
+            build -quiet
+
+      - name: Package unsigned IPA
+        working-directory: app
+        run: |
+          APP_PATH=$(ls -d build/DerivedData/Build/Products/Release-iphoneos/*.app | head -1)
+          echo "Built app: $APP_PATH"
+          ls -la "$APP_PATH"
+          mkdir -p Payload
+          cp -r "$APP_PATH" Payload/
+          zip -r ../FishPocket-unsigned.ipa Payload
+          ls -la ../FishPocket-unsigned.ipa
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: FishPocket-unsigned-ipa
+          path: FishPocket-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 7
